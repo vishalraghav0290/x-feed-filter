@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "X Feed Filter",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Keep only the posts you care about in your X (Twitter) For You feed, using your own keywords. Ships with an aviation preset. Runs on-device.",
   "permissions": ["storage"],
   "host_permissions": [
