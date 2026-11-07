@@ -45,8 +45,7 @@ const DEFAULT_KEYWORDS: readonly string[] = [
   "iaf_mcc", "surya kiran", "sarang", "tejas", "hal tejas", "lca tejas",
   "hindustan aeronautics", "sukhoi", "su-30", "su-30mki", "mig-21", "mig-29",
   "rafale", "jaguar", "mirage 2000", "tejas mk1a", "tejas mk2", "amca",
-  "c-17", "c-130", "globemaster", "hercules", "chinook", "apache", "prachand",
-  "dhruv", "rudra", "garud", "aero india", "republic day flypast", "flypast",
+  "c-17", "c-130", "globemaster", "hercules", "chinook", "apache", "prachand", "rudra", "garud", "aero india", "republic day flypast", "flypast",
   "air warrior", "iaf day", "air force day"
 ];
 
