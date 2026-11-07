@@ -5,24 +5,33 @@
  * Depends on keywords.ts (injected first) for DEFAULT_KEYWORDS,
  * SETTINGS_KEYS and resolveKeywords.
  *
- * Design notes:
- *  - We NEVER touch the scroll position. X runs its own virtualized scroller;
- *    the moment an extension writes scrollTop it fights the page and you get
- *    the "jumps around / infinite scroll" behaviour. So we only ever toggle
- *    `display` on timeline rows and let X manage layout and heights.
- *  - We only act on the Home "For You" timeline, scoped to the primary column.
- *    On a tweet's detail/replies page, a profile, search, etc. we do nothing,
- *    so opening a tweet's comments is completely unaffected.
- *  - A post is matched on its real tweet text ([data-testid="tweetText"]),
- *    not the whole article's innerText (which includes names, handles,
- *    timestamps and quoted tweets).
+ * Why this is written the way it is (two bugs it must avoid):
+ *
+ *  1. "The page scrolls around on its own."
+ *     - We NEVER write scrollTop. An extension that moves the scroll fights
+ *       X's virtualized timeline and throws the viewport around.
+ *     - We also set `overflow-anchor: none` on the timeline. Browser scroll
+ *       anchoring tries to "helpfully" keep content in place when the height
+ *       of elements above the viewport changes. When we hide a row, that
+ *       compensation is itself a scroll jump. Turning it off stops it.
+ *
+ *  2. "Opening a tweet's comments and closing it scrolls me somewhere else."
+ *     - Opening a tweet navigates away from /home; X remembers the feed scroll
+ *       offset and restores it when you go back. That restore only lands
+ *       correctly if the feed's total height is the SAME as when you left.
+ *     - So the moment we leave the For You feed we reveal every row (feed
+ *       geometry returns to exactly what X expects) and stop touching the DOM.
+ *       We only re-apply the filter once we're settled back on the feed.
+ *
+ * Hiding is done with a single injected CSS class, not per-element inline
+ * styles, so toggling is cheap and does not thrash layout.
  */
 (function () {
   "use strict";
 
   interface FilterState {
     enabled: boolean;
-    fullyRemove: boolean; // false = dim+shrink, true = fully hidden
+    fullyRemove: boolean; // false = dim, true = collapse to nothing
     keywords: string[];
     kept: number;
     hidden: number;
@@ -36,17 +45,34 @@
     hidden: 0
   };
 
-  // Decision marker. Placed on the timeline cell wrapper, not the <article>,
-  // so the whole row collapses with no leftover gap.
+  // Decision marker, placed on the timeline cell wrapper (not the <article>).
   const ATTR = "data-xff";
+  const STYLE_ID = "xff-style";
+
+  /* ---------------------------------------------------------------- *
+   * Injected stylesheet                                               *
+   * ---------------------------------------------------------------- */
+
+  // All visual hiding lives here. `.xff-dim` fades a non-matching post but
+  // leaves its box in place; `.xff-gone` collapses it. `overflow-anchor:none`
+  // on the timeline stops the browser from auto-compensating the scroll when
+  // our hiding changes heights.
+  function ensureStyle(): void {
+    if (document.getElementById(STYLE_ID)) return;
+    const css =
+      '[data-testid="primaryColumn"] [aria-label] { overflow-anchor: none; }' +
+      '.xff-dim { opacity: 0.12 !important; filter: grayscale(1) !important; }' +
+      '.xff-gone { display: none !important; }';
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = css;
+    (document.head || document.documentElement).appendChild(style);
+  }
 
   /* ---------------------------------------------------------------- *
    * Extension-context lifecycle                                       *
    * ---------------------------------------------------------------- */
 
-  // When the extension is reloaded/updated, this old content script loses its
-  // connection ("Extension context invalidated"). Detect that and shut down
-  // quietly instead of throwing on every chrome.* call.
   function extensionAlive(): boolean {
     try {
       return !!(chrome.runtime && chrome.runtime.id);
@@ -65,6 +91,8 @@
     try { allMarkedCells().forEach(reveal); } catch (e) { /* ignore */ }
     const b = document.getElementById("xff-badge");
     if (b) b.remove();
+    const s = document.getElementById(STYLE_ID);
+    if (s) s.remove();
   }
 
   function safeStorageGet(keys: string[], cb: (res: StoredSettings) => void): void {
@@ -99,7 +127,7 @@
     }
     // Tabs not readable yet: assume For You (X defaults to it) so a fresh load
     // filters immediately. If Following is actually selected, the next scan
-    // once tabs render will see sawSelected and bail.
+    // once tabs render sees sawSelected and bails.
     return !sawSelected;
   }
 
@@ -107,9 +135,8 @@
     return onForYou();
   }
 
-  // The scrollable timeline container for the primary column. We only ever
-  // query cells inside this, so replies, the right sidebar, modals, etc. are
-  // never touched.
+  // The primary-column timeline region. We only query cells inside this, so
+  // replies, the right sidebar, modals, etc. are never touched.
   function timeline(): HTMLElement | null {
     const primary = document.querySelector<HTMLElement>('[data-testid="primaryColumn"]');
     if (!primary) return null;
@@ -118,7 +145,6 @@
       || primary;
   }
 
-  // Timeline post rows. Each real feed post sits in a cellInnerDiv wrapper.
   function timelineCells(): HTMLElement[] {
     const root = timeline();
     if (!root) return [];
@@ -137,9 +163,6 @@
     return state.keywords.map(k => String(k).toLowerCase().trim()).filter(Boolean);
   }
 
-  // Whole-word, case-insensitive matchers. Stops "atc" matching inside
-  // "watch". Phrases ("air india"), hyphenated ("su-30") and numeric ("737")
-  // keywords all work.
   function escapeRegExp(s: string): string {
     return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
@@ -158,8 +181,8 @@
     return MATCHERS.some(re => re.test(text));
   }
 
-  // Pull the human-readable text of a post: its tweet body plus the body of a
-  // quoted tweet, if any. Returns "" when the post hasn't rendered text yet.
+  // Tweet body text (plus a quoted tweet's body, if present). Empty string
+  // until the post has actually rendered its text.
   function postText(cell: HTMLElement): string {
     const parts = cell.querySelectorAll<HTMLElement>('[data-testid="tweetText"]');
     if (!parts.length) return "";
@@ -168,37 +191,30 @@
     return text;
   }
 
-  // Does this cell actually contain a tweet we can judge? (Skips "who to
-  // follow", trends, promoted modules and not-yet-rendered placeholders.)
+  // A cell we can actually judge: a real tweet with rendered text. Skips
+  // "who to follow", trends, promoted modules and not-yet-rendered rows.
   function isJudgeableTweet(cell: HTMLElement): boolean {
     if (!cell.querySelector('article')) return false;
     return !!cell.querySelector('[data-testid="tweetText"]');
   }
 
   /* ---------------------------------------------------------------- *
-   * Hide / reveal (display only; never geometry or scroll)            *
+   * Hide / reveal via CSS classes (no geometry writes, no scroll)     *
    * ---------------------------------------------------------------- */
 
   function hide(cell: HTMLElement): void {
-    if (state.fullyRemove) {
-      cell.style.display = "none";
-    } else {
-      cell.style.opacity = "0.12";
-      cell.style.filter = "grayscale(1)";
-    }
+    cell.classList.remove(state.fullyRemove ? "xff-dim" : "xff-gone");
+    cell.classList.add(state.fullyRemove ? "xff-gone" : "xff-dim");
     cell.setAttribute(ATTR, "hidden");
   }
 
   function reveal(cell: HTMLElement): void {
-    cell.style.display = "";
-    cell.style.opacity = "";
-    cell.style.filter = "";
+    cell.classList.remove("xff-dim", "xff-gone");
     cell.removeAttribute(ATTR);
   }
 
   /* ---------------------------------------------------------------- *
-   * Observer + scan. We pause the observer around our own writes so   *
-   * our mutations don't trigger an endless re-scan loop.              *
+   * Observer + scan                                                   *
    * ---------------------------------------------------------------- */
 
   let observer: MutationObserver | null = null;
@@ -209,7 +225,7 @@
   }
   function resumeObserver(): void {
     const root = timeline() || document.body;
-    if (observer && root) {
+    if (observer && root && !shuttingDown) {
       observer.observe(root, { childList: true, subtree: true });
     }
   }
@@ -227,6 +243,9 @@
   function scan(): void {
     if (!extensionAlive()) { shutdown(); return; }
     if (!state.enabled) return;
+    // Off the feed (e.g. a tweet's comments are open): keep the feed exactly
+    // as X left it so its scroll restore on close is correct. Reveal anything
+    // we had hidden and do nothing else.
     if (!onFilterablePage()) { unfilterAll(); return; }
 
     pauseObserver();
@@ -235,14 +254,12 @@
       cells.forEach(cell => {
         const existing = cell.getAttribute(ATTR);
         if (!isJudgeableTweet(cell)) {
-          // Not a tweet (module/placeholder). Leave it fully alone; if we had
-          // marked it earlier (e.g. before it rendered), clear that.
-          if (existing) reveal(cell);
+          if (existing) reveal(cell); // was marked before it rendered
           return;
         }
         if (existing === "kept") return; // keep decisions are final
         if (matchesKeywords(postText(cell))) {
-          if (existing) reveal(cell); // was hidden before text loaded
+          if (existing) reveal(cell);
           cell.setAttribute(ATTR, "kept");
         } else {
           hide(cell);
@@ -255,7 +272,6 @@
     }
   }
 
-  // Coalesce bursts of DOM mutations into one scan per frame.
   function scheduleScan(): void {
     if (scanScheduled) return;
     scanScheduled = true;
@@ -333,35 +349,38 @@
     if (typeof res.fullyRemove === "boolean") state.fullyRemove = res.fullyRemove;
     setKeywords(resolveKeywords(res));
 
+    ensureStyle();
     observer = new MutationObserver(scheduleScan);
     scheduleScan();
     resumeObserver();
 
-    // Light safety-net scan. No scroll pinning, no geometry: just catches
-    // posts that streamed in without tripping the observer.
+    // Safety-net scan. No scroll pinning, no geometry: just catches posts that
+    // streamed in without tripping the observer.
     timers.push(setInterval(() => {
       if (!extensionAlive()) { shutdown(); return; }
+      ensureStyle();
       scheduleScan();
     }, 1500));
 
     // Detect entering/leaving the filterable page. Covers SPA navigation
-    // (path change) and the For You / Following tab switch (same /home path).
-    // Leaving For You reveals everything so nothing is left interfered with,
-    // and re-attaches the observer to the new timeline container.
+    // (opening a tweet, profiles, search) and the For You / Following tab
+    // switch. Leaving reveals everything so X's scroll restore on return is
+    // correct; entering re-binds the observer to the current timeline and
+    // re-applies on the next frame.
     let wasFilterable = onFilterablePage();
     timers.push(setInterval(() => {
       if (!extensionAlive()) { shutdown(); return; }
       const isFilterable = onFilterablePage();
       if (isFilterable !== wasFilterable) {
         wasFilterable = isFilterable;
-        clearAllMarks();      // reveal anything from the previous view
+        clearAllMarks();
         pauseObserver();
-        resumeObserver();     // re-bind to the current timeline root
+        resumeObserver();
         if (isFilterable) scheduleScan();
-        else { recount(); }
+        else recount();
         updateBadge();
       }
-    }, 400));
+    }, 300));
   });
 
   /* ---------------------------------------------------------------- *
@@ -380,7 +399,13 @@
         }
         if (changes.fullyRemove) {
           state.fullyRemove = changes.fullyRemove.newValue as boolean;
-          rescan();
+          // Re-apply hide class to already-hidden cells under the new mode.
+          pauseObserver();
+          try {
+            allMarkedCells().forEach(cell => {
+              if (cell.getAttribute(ATTR) === "hidden") hide(cell);
+            });
+          } finally { resumeObserver(); }
         }
         if (changes.keywordList || changes.customKeywords) {
           safeStorageGet(["keywordList", "customKeywords"], (res) => {
