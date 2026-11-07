@@ -1,24 +1,31 @@
 /* X Feed Filter (content script)
  * Hides "For You" timeline posts whose text doesn't match any of your
  * keywords. Ships with an aviation keyword preset by default.
- * State (on/off, mode, custom keywords) lives in chrome.storage.sync.
+ * State (on/off, mode, keyword list) lives in chrome.storage.sync.
  * Depends on keywords.ts (injected first) for DEFAULT_KEYWORDS,
  * SETTINGS_KEYS and resolveKeywords.
+ *
+ * Design notes:
+ *  - We NEVER touch the scroll position. X runs its own virtualized scroller;
+ *    the moment an extension writes scrollTop it fights the page and you get
+ *    the "jumps around / infinite scroll" behaviour. So we only ever toggle
+ *    `display` on timeline rows and let X manage layout and heights.
+ *  - We only act on the Home "For You" timeline, scoped to the primary column.
+ *    On a tweet's detail/replies page, a profile, search, etc. we do nothing,
+ *    so opening a tweet's comments is completely unaffected.
+ *  - A post is matched on its real tweet text ([data-testid="tweetText"]),
+ *    not the whole article's innerText (which includes names, handles,
+ *    timestamps and quoted tweets).
  */
 (function () {
   "use strict";
 
   interface FilterState {
     enabled: boolean;
-    fullyRemove: boolean; // false = collapse+dim, true = display:none
+    fullyRemove: boolean; // false = dim+shrink, true = fully hidden
     keywords: string[];
     kept: number;
     hidden: number;
-  }
-
-  interface Anchor {
-    post: HTMLElement;
-    top: number;
   }
 
   const state: FilterState = {
@@ -29,7 +36,13 @@
     hidden: 0
   };
 
-  const ATTR = "data-avf";
+  // Decision marker. Placed on the timeline cell wrapper, not the <article>,
+  // so the whole row collapses with no leftover gap.
+  const ATTR = "data-xff";
+
+  /* ---------------------------------------------------------------- *
+   * Extension-context lifecycle                                       *
+   * ---------------------------------------------------------------- */
 
   // When the extension is reloaded/updated, this old content script loses its
   // connection ("Extension context invalidated"). Detect that and shut down
@@ -43,18 +56,17 @@
   }
 
   const timers: ReturnType<typeof setInterval>[] = [];
+  let shuttingDown = false;
   function shutdown(): void {
+    if (shuttingDown) return;
+    shuttingDown = true;
     try { if (observer) observer.disconnect(); } catch (e) { /* ignore */ }
     timers.forEach(clearInterval);
-    // Reveal any posts we had hidden so the page is left clean.
-    try {
-      allMarkedPosts().forEach(clearHidden);
-    } catch (e) { /* ignore */ }
-    const b = document.getElementById("avf-badge");
+    try { allMarkedCells().forEach(reveal); } catch (e) { /* ignore */ }
+    const b = document.getElementById("xff-badge");
     if (b) b.remove();
   }
 
-  // Safe wrappers: no-op if the extension context is gone.
   function safeStorageGet(keys: string[], cb: (res: StoredSettings) => void): void {
     if (!extensionAlive()) return;
     try { chrome.storage.sync.get(keys, (items) => cb(items as StoredSettings)); } catch (e) { shutdown(); }
@@ -64,44 +76,70 @@
     try { chrome.storage.sync.set(obj); } catch (e) { shutdown(); }
   }
 
-  // Only ever touch the "For You" home feed. Anywhere else — Following tab,
-  // profiles, search, individual posts, notifications — the extension does
-  // nothing at all. X is a SPA, so every scan re-checks this.
+  /* ---------------------------------------------------------------- *
+   * Where are we? Only the Home "For You" timeline is filterable.     *
+   * ---------------------------------------------------------------- */
+
   function onHome(): boolean {
     return location.pathname === "/home";
   }
-  // The home page has two tabs ("For You" / "Following"), both at /home.
-  // Only filter when the "For You" tab is the selected one.
+
+  // Home has two tabs ("For You" / "Following"), both at /home. Only filter
+  // when "For You" is the selected tab.
   function onForYou(): boolean {
     if (!onHome()) return false;
-    const tabs = document.querySelectorAll<HTMLElement>('[role="tab"]');
+    const tabs = document.querySelectorAll<HTMLElement>('[role="tablist"] [role="tab"]');
+    let sawSelected = false;
     for (const tab of Array.from(tabs)) {
       if (tab.getAttribute("aria-selected") === "true") {
-        const label = (tab.innerText || "").trim().toLowerCase();
-        return label.includes("for you");
+        sawSelected = true;
+        const label = (tab.textContent || "").trim().toLowerCase();
+        if (label.includes("for you")) return true;
       }
     }
-    // If we can't read the tabs yet, don't assume — stay off until we can.
-    return false;
+    // Tabs not readable yet: assume For You (X defaults to it) so a fresh load
+    // filters immediately. If Following is actually selected, the next scan
+    // once tabs render will see sawSelected and bail.
+    return !sawSelected;
   }
+
   function onFilterablePage(): boolean {
     return onForYou();
   }
 
-  function allMarkedPosts(): HTMLElement[] {
-    return Array.from(document.querySelectorAll<HTMLElement>("article[" + ATTR + "]"));
+  // The scrollable timeline container for the primary column. We only ever
+  // query cells inside this, so replies, the right sidebar, modals, etc. are
+  // never touched.
+  function timeline(): HTMLElement | null {
+    const primary = document.querySelector<HTMLElement>('[data-testid="primaryColumn"]');
+    if (!primary) return null;
+    return primary.querySelector<HTMLElement>('section [aria-label] [role="region"]')
+      || primary.querySelector<HTMLElement>('div[aria-label][role="region"]')
+      || primary;
   }
+
+  // Timeline post rows. Each real feed post sits in a cellInnerDiv wrapper.
+  function timelineCells(): HTMLElement[] {
+    const root = timeline();
+    if (!root) return [];
+    return Array.from(root.querySelectorAll<HTMLElement>('[data-testid="cellInnerDiv"]'));
+  }
+
+  function allMarkedCells(): HTMLElement[] {
+    return Array.from(document.querySelectorAll<HTMLElement>("[" + ATTR + "]"));
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Keyword matching                                                  *
+   * ---------------------------------------------------------------- */
 
   function normalizedKeywords(): string[] {
     return state.keywords.map(k => String(k).toLowerCase().trim()).filter(Boolean);
   }
 
-  // Build word-boundary matchers instead of plain substring search. This stops
-  // false positives like "atc" matching inside "WATCH", or "apu" inside
-  // "Singapure". A keyword matches only when it stands as its own token,
-  // bounded by non-alphanumeric characters (spaces, punctuation, start/end).
-  // Multi-word phrases ("air india") and hyphenated types ("su-30", "f-16")
-  // and numeric types ("737") all work correctly under this rule.
+  // Whole-word, case-insensitive matchers. Stops "atc" matching inside
+  // "watch". Phrases ("air india"), hyphenated ("su-30") and numeric ("737")
+  // keywords all work.
   function escapeRegExp(s: string): string {
     return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
@@ -116,38 +154,53 @@
   }
 
   function matchesKeywords(text: string): boolean {
-    const t = text || "";
-    return MATCHERS.some(re => re.test(t));
+    if (!text) return false;
+    return MATCHERS.some(re => re.test(text));
   }
 
-  function applyHidden(post: HTMLElement): void {
+  // Pull the human-readable text of a post: its tweet body plus the body of a
+  // quoted tweet, if any. Returns "" when the post hasn't rendered text yet.
+  function postText(cell: HTMLElement): string {
+    const parts = cell.querySelectorAll<HTMLElement>('[data-testid="tweetText"]');
+    if (!parts.length) return "";
+    let text = "";
+    parts.forEach(p => { text += " " + (p.textContent || ""); });
+    return text;
+  }
+
+  // Does this cell actually contain a tweet we can judge? (Skips "who to
+  // follow", trends, promoted modules and not-yet-rendered placeholders.)
+  function isJudgeableTweet(cell: HTMLElement): boolean {
+    if (!cell.querySelector('article')) return false;
+    return !!cell.querySelector('[data-testid="tweetText"]');
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Hide / reveal (display only; never geometry or scroll)            *
+   * ---------------------------------------------------------------- */
+
+  function hide(cell: HTMLElement): void {
     if (state.fullyRemove) {
-      post.style.display = "none";
+      cell.style.display = "none";
     } else {
-      post.style.opacity = "0.06";
-      post.style.filter = "grayscale(1)";
-      post.style.maxHeight = "0px";
-      post.style.overflow = "hidden";
-      post.style.pointerEvents = "none";
+      cell.style.opacity = "0.12";
+      cell.style.filter = "grayscale(1)";
     }
-    post.setAttribute(ATTR, "hidden");
+    cell.setAttribute(ATTR, "hidden");
   }
 
-  function clearHidden(post: HTMLElement): void {
-    post.style.opacity = "";
-    post.style.filter = "";
-    post.style.maxHeight = "";
-    post.style.overflow = "";
-    post.style.pointerEvents = "";
-    post.style.display = "";
-    post.removeAttribute(ATTR);
+  function reveal(cell: HTMLElement): void {
+    cell.style.display = "";
+    cell.style.opacity = "";
+    cell.style.filter = "";
+    cell.removeAttribute(ATTR);
   }
 
-  /* ---- observer control: pause while we mutate the DOM ourselves ----
-   * X builds its entire UI dynamically. If our own DOM writes (styles,
-   * attributes, badge) keep waking the observer, we re-scan forever and the
-   * page never finishes rendering. So we disconnect around our writes and
-   * debounce scans. */
+  /* ---------------------------------------------------------------- *
+   * Observer + scan. We pause the observer around our own writes so   *
+   * our mutations don't trigger an endless re-scan loop.              *
+   * ---------------------------------------------------------------- */
+
   let observer: MutationObserver | null = null;
   let scanScheduled = false;
 
@@ -155,78 +208,54 @@
     if (observer) observer.disconnect();
   }
   function resumeObserver(): void {
-    if (observer) {
-      observer.observe(document.documentElement, { childList: true, subtree: true });
+    const root = timeline() || document.body;
+    if (observer && root) {
+      observer.observe(root, { childList: true, subtree: true });
     }
   }
 
-  // Un-hide everything we touched, without waking our own observer.
   function clearAllMarks(): void {
     pauseObserver();
-    try {
-      allMarkedPosts().forEach(clearHidden);
-    } finally {
-      resumeObserver();
-    }
+    try { allMarkedCells().forEach(reveal); } finally { resumeObserver(); }
   }
 
   function recount(): void {
-    state.kept = document.querySelectorAll('article[' + ATTR + '="kept"]').length;
-    state.hidden = document.querySelectorAll('article[' + ATTR + '="hidden"]').length;
-  }
-
-  // Returns the element that actually scrolls the timeline.
-  function scroller(): Element {
-    return document.scrollingElement || document.documentElement;
-  }
-
-  // Anchor: keep the same on-screen content stable while we collapse posts.
-  // We pick the first post whose top is at/below the current viewport top,
-  // remember where it sits relative to the viewport, then after mutating we
-  // restore the scroll so that post stays put. This prevents the "I ended up
-  // in the middle" drift caused by collapsing posts above the viewport.
-  function pickAnchor(): Anchor | null {
-    const posts = document.querySelectorAll<HTMLElement>("article");
-    for (const post of Array.from(posts)) {
-      const top = post.getBoundingClientRect().top;
-      if (top >= 0) return { post, top };
-    }
-    return null;
-  }
-  function restoreAnchor(anchor: Anchor | null): void {
-    if (!anchor || !anchor.post.isConnected) return;
-    const newTop = anchor.post.getBoundingClientRect().top;
-    const delta = newTop - anchor.top;
-    if (Math.abs(delta) > 0.5) {
-      scroller().scrollTop += delta;
-    }
+    state.kept = document.querySelectorAll('[' + ATTR + '="kept"]').length;
+    state.hidden = document.querySelectorAll('[' + ATTR + '="hidden"]').length;
   }
 
   function scan(): void {
+    if (!extensionAlive()) { shutdown(); return; }
     if (!state.enabled) return;
     if (!onFilterablePage()) { unfilterAll(); return; }
+
     pauseObserver();
-    const anchor = pickAnchor();
     try {
-      const posts = document.querySelectorAll<HTMLElement>("article");
-      posts.forEach(post => {
-        if (post.getAttribute(ATTR)) return; // already decided
-        const text = post.innerText || "";
-        if (matchesKeywords(text)) {
-          post.setAttribute(ATTR, "kept");
+      const cells = timelineCells();
+      cells.forEach(cell => {
+        const existing = cell.getAttribute(ATTR);
+        if (!isJudgeableTweet(cell)) {
+          // Not a tweet (module/placeholder). Leave it fully alone; if we had
+          // marked it earlier (e.g. before it rendered), clear that.
+          if (existing) reveal(cell);
+          return;
+        }
+        if (existing === "kept") return; // keep decisions are final
+        if (matchesKeywords(postText(cell))) {
+          if (existing) reveal(cell); // was hidden before text loaded
+          cell.setAttribute(ATTR, "kept");
         } else {
-          applyHidden(post);
+          hide(cell);
         }
       });
       recount();
       updateBadge();
     } finally {
-      restoreAnchor(anchor);
       resumeObserver();
     }
   }
 
-  // Debounced scan: coalesce bursts of DOM mutations into one scan.
+  // Coalesce bursts of DOM mutations into one scan per frame.
   function scheduleScan(): void {
     if (scanScheduled) return;
     scanScheduled = true;
@@ -239,7 +268,7 @@
   function unfilterAll(): void {
     pauseObserver();
     try {
-      allMarkedPosts().forEach(clearHidden);
+      allMarkedCells().forEach(reveal);
       recount();
       updateBadge();
     } finally {
@@ -247,18 +276,21 @@
     }
   }
 
-  // Clear all decisions and re-run the filter from scratch.
   function rescan(): void {
     clearAllMarks();
-    scan();
+    scheduleScan();
   }
 
-  /* ---- badge ---- */
+  /* ---------------------------------------------------------------- *
+   * Floating badge / toggle                                           *
+   * ---------------------------------------------------------------- */
+
   let badge: HTMLDivElement | undefined;
   function badgeEl(): HTMLDivElement | undefined {
+    if (shuttingDown) return undefined;
     if (!badge && document.body) {
       const el = document.createElement("div");
-      el.id = "avf-badge";
+      el.id = "xff-badge";
       el.style.cssText =
         "position:fixed;bottom:16px;right:14px;z-index:2147483647;" +
         "background:#0d1b2a;color:#4fa3ff;font:600 12px/1 system-ui,sans-serif;" +
@@ -271,12 +303,8 @@
         e.stopPropagation();
         state.enabled = !state.enabled;
         safeStorageSet({ enabled: state.enabled });
-        if (state.enabled) {
-          scan();
-        } else {
-          // Reveal everything and keep it revealed until re-enabled.
-          unfilterAll();
-        }
+        if (state.enabled) rescan();
+        else unfilterAll();
         updateBadge();
       }, true);
       document.body.appendChild(el);
@@ -287,7 +315,6 @@
   function updateBadge(): void {
     const b = badgeEl();
     if (!b) return;
-    // Hide the badge entirely on pages we don't filter.
     if (!onFilterablePage()) { b.style.display = "none"; return; }
     b.style.display = "";
     b.textContent = state.enabled
@@ -297,7 +324,10 @@
     b.style.color = state.enabled ? "#4fa3ff" : "#ffb74d";
   }
 
-  /* ---- load state, then start ---- */
+  /* ---------------------------------------------------------------- *
+   * Startup                                                           *
+   * ---------------------------------------------------------------- */
+
   safeStorageGet(SETTINGS_KEYS, (res) => {
     if (typeof res.enabled === "boolean") state.enabled = res.enabled;
     if (typeof res.fullyRemove === "boolean") state.fullyRemove = res.fullyRemove;
@@ -307,49 +337,37 @@
     scheduleScan();
     resumeObserver();
 
-    // On a fresh page load, if we started at (or very near) the top of the
-    // feed, hold the scroll pinned to the top for a short window. As posts
-    // stream in and get collapsed, X's height changes would otherwise nudge
-    // the view downward — this keeps a refresh landing you at the top.
-    if (onFilterablePage() && scroller().scrollTop < 200) {
-      const pinUntil = Date.now() + 2500;
-      const pin = setInterval(() => {
-        if (!extensionAlive()) { clearInterval(pin); return; }
-        if (Date.now() > pinUntil) { clearInterval(pin); return; }
-        // Only re-pin if drift pushed us down slightly; never fight a
-        // deliberate user scroll further down the page.
-        if (scroller().scrollTop > 0 && scroller().scrollTop < 600) {
-          scroller().scrollTop = 0;
-        }
-      }, 100);
-      timers.push(pin);
-    }
-
-    // Light periodic safety net (debounced), far less aggressive than before.
+    // Light safety-net scan. No scroll pinning, no geometry: just catches
+    // posts that streamed in without tripping the observer.
     timers.push(setInterval(() => {
       if (!extensionAlive()) { shutdown(); return; }
       scheduleScan();
-    }, 2000));
+    }, 1500));
 
-    // Detect changes to whether we should be filtering. This covers both
-    // SPA navigation (path change) and switching the home tab between
-    // "For You" and "Following" (same /home path, no reload). The moment we
-    // leave "For You", everything is un-filtered so there's zero interference.
+    // Detect entering/leaving the filterable page. Covers SPA navigation
+    // (path change) and the For You / Following tab switch (same /home path).
+    // Leaving For You reveals everything so nothing is left interfered with,
+    // and re-attaches the observer to the new timeline container.
     let wasFilterable = onFilterablePage();
     timers.push(setInterval(() => {
       if (!extensionAlive()) { shutdown(); return; }
       const isFilterable = onFilterablePage();
       if (isFilterable !== wasFilterable) {
         wasFilterable = isFilterable;
-        clearAllMarks();
+        clearAllMarks();      // reveal anything from the previous view
+        pauseObserver();
+        resumeObserver();     // re-bind to the current timeline root
         if (isFilterable) scheduleScan();
-        else recount();
+        else { recount(); }
         updateBadge();
       }
     }, 400));
   });
 
-  /* ---- react to popup changes live ---- */
+  /* ---------------------------------------------------------------- *
+   * React to popup changes live                                       *
+   * ---------------------------------------------------------------- */
+
   if (extensionAlive()) {
     try {
       chrome.storage.onChanged.addListener((changes, area) => {
@@ -365,7 +383,6 @@
           rescan();
         }
         if (changes.keywordList || changes.customKeywords) {
-          // Re-read both keys so precedence stays correct.
           safeStorageGet(["keywordList", "customKeywords"], (res) => {
             setKeywords(resolveKeywords(res));
             rescan();
