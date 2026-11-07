@@ -65,10 +65,12 @@
     // collapses the row entirely ("Fully remove posts" mode).
     const css =
       '[data-testid="primaryColumn"] [aria-label] { overflow-anchor: none; }' +
-      '.xff-dim { position: relative !important; }' +
-      '.xff-dim > * { visibility: hidden !important; }' +
-      '.xff-dim::after { content: "" !important; position: absolute !important;' +
-      ' inset: 0 !important; background: #000 !important; pointer-events: none !important; }' +
+      // Collapse the row to a thin black bar: content removed from layout, a
+      // short fixed height so there is minimal dead space, solid black fill.
+      '.xff-dim { position: relative !important; height: 6px !important;' +
+      ' min-height: 6px !important; overflow: hidden !important;' +
+      ' background: #000 !important; box-sizing: border-box !important; }' +
+      '.xff-dim > * { display: none !important; }' +
       '.xff-gone { display: none !important; }';
     if (existing) {
       if (existing.textContent !== css) existing.textContent = css;

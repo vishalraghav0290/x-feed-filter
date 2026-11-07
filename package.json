@@ -1,6 +1,6 @@
 {
   "name": "x-feed-filter",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "private": true,
   "description": "Browser extension that filters the X (Twitter) For You feed by keyword.",
   "scripts": {
