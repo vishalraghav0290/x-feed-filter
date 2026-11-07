@@ -1,4 +1,4 @@
-// Popup UI: on/off toggle, hide mode, and the editable keyword list.
+// Popup UI: on/off toggle and the editable keyword list.
 // Depends on keywords.ts (loaded first by popup.html) for DEFAULT_KEYWORDS,
 // SETTINGS_KEYS and resolveKeywords.
 (function () {
@@ -11,7 +11,6 @@
   }
 
   const enabledEl = byId<HTMLInputElement>("enabled");
-  const fullyRemoveEl = byId<HTMLInputElement>("fullyRemove");
   const keywordListEl = byId<HTMLTextAreaElement>("keywordList");
   const countEl = byId<HTMLDivElement>("count");
   const savedMsg = byId<HTMLDivElement>("savedMsg");
@@ -45,7 +44,6 @@
   chrome.storage.sync.get(SETTINGS_KEYS, (items) => {
     const res = items as StoredSettings;
     enabledEl.checked = res.enabled !== false; // default on
-    fullyRemoveEl.checked = res.fullyRemove === true;
     renderList(resolveKeywords(res));
   });
 
@@ -53,10 +51,6 @@
 
   enabledEl.addEventListener("change", () => {
     chrome.storage.sync.set({ enabled: enabledEl.checked });
-  });
-
-  fullyRemoveEl.addEventListener("change", () => {
-    chrome.storage.sync.set({ fullyRemove: fullyRemoveEl.checked });
   });
 
   byId<HTMLButtonElement>("save").addEventListener("click", () => {

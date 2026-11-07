@@ -52,14 +52,13 @@ const DEFAULT_KEYWORDS: readonly string[] = [
 /** Settings persisted in chrome.storage.sync (shared by content script and popup). */
 interface StoredSettings {
   enabled?: boolean;
-  fullyRemove?: boolean;
   /** Legacy: extra keywords appended to the defaults. */
   customKeywords?: string[];
   /** Full user-editable keyword list (takes precedence over defaults). */
   keywordList?: string[];
 }
 
-const SETTINGS_KEYS: (keyof StoredSettings)[] = ["enabled", "fullyRemove", "customKeywords", "keywordList"];
+const SETTINGS_KEYS: (keyof StoredSettings)[] = ["enabled", "customKeywords", "keywordList"];
 
 // Resolve the effective keyword list from stored state.
 // - keywordList: full user-editable list (takes precedence).

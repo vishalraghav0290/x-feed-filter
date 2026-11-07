@@ -13,5 +13,5 @@
     "removeComments": false,
     "newLine": "lf"
   },
-  "files": ["src/keywords.ts", "src/content.ts", "src/popup.ts"]
+  "files": ["src/keywords.ts", "src/inject.ts", "src/content.ts", "src/popup.ts"]
 }

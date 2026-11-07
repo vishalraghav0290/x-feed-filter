@@ -38,14 +38,6 @@
     <input type="checkbox" id="enabled" />
   </div>
 
-  <div class="row">
-    <div>
-      <label for="fullyRemove">Fully remove posts</label>
-      <div class="hint" id="fullyRemoveHint">Off = collapse &amp; dim · On = hide completely</div>
-    </div>
-    <input type="checkbox" id="fullyRemove" aria-describedby="fullyRemoveHint" />
-  </div>
-
   <div style="padding-top:12px;border-top:1px solid #22323f;">
     <label for="keywordList">Filter keywords</label>
     <div class="hint" id="keywordHint">A post is kept if it contains any of these (comma separated). Edit freely: remove ones you don't want, add your own.</div>
@@ -56,6 +48,7 @@
       <button id="reset" class="secondary">Reset to aviation preset</button>
     </div>
     <div class="saved" id="savedMsg" role="status"></div>
+    <div class="hint">Changes apply to posts that load next. Reload X to re-filter the feed already on screen.</div>
   </div>
 
   <script src="keywords.js"></script>
