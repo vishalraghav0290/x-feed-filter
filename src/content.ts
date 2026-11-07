@@ -58,11 +58,22 @@
   // on the timeline stops the browser from auto-compensating the scroll when
   // our hiding changes heights.
   function ensureStyle(): void {
-    if (document.getElementById(STYLE_ID)) return;
+    const existing = document.getElementById(STYLE_ID);
+    // `.xff-dim` blacks the post out completely while keeping its box in the
+    // layout (so the scroll position stays stable). The inner content is made
+    // invisible and a solid black fill is painted over the row. `.xff-gone`
+    // collapses the row entirely ("Fully remove posts" mode).
     const css =
       '[data-testid="primaryColumn"] [aria-label] { overflow-anchor: none; }' +
-      '.xff-dim { opacity: 0.12 !important; filter: grayscale(1) !important; }' +
+      '.xff-dim { position: relative !important; }' +
+      '.xff-dim > * { visibility: hidden !important; }' +
+      '.xff-dim::after { content: "" !important; position: absolute !important;' +
+      ' inset: 0 !important; background: #000 !important; pointer-events: none !important; }' +
       '.xff-gone { display: none !important; }';
+    if (existing) {
+      if (existing.textContent !== css) existing.textContent = css;
+      return;
+    }
     const style = document.createElement("style");
     style.id = STYLE_ID;
     style.textContent = css;
