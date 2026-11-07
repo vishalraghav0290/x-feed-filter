@@ -101,6 +101,9 @@
     if (shuttingDown) return;
     shuttingDown = true;
     try { if (observer) observer.disconnect(); } catch (e) { /* ignore */ }
+    try { window.removeEventListener("scroll", onScroll, true); } catch (e) { /* ignore */ }
+    if (scanTimer) { clearTimeout(scanTimer); scanTimer = null; }
+    if (scrollIdleTimer) { clearTimeout(scrollIdleTimer); scrollIdleTimer = null; }
     timers.forEach(clearInterval);
     try { allMarkedCells().forEach(reveal); } catch (e) { /* ignore */ }
     const b = document.getElementById("xff-badge");
@@ -229,81 +232,91 @@
 
   /* ---------------------------------------------------------------- *
    * Observer + scan                                                   *
+   *                                                                   *
+   * Smoothness rules:                                                 *
+   *  - One observer, attached once. We NEVER disconnect/reattach it   *
+   *    per scan (doing that on a huge subtree every frame is what     *
+   *    made scrolling janky).                                         *
+   *  - We react to added nodes only, and ignore our own class/attr    *
+   *    writes, so hiding a post never feeds back into the observer.   *
+   *  - Scans are throttled to a fixed cadence and are skipped while   *
+   *    the user is actively scrolling; one scan runs once scrolling   *
+   *    settles. So nothing heavy happens during a scroll gesture.     *
+   *  - Each scan only looks at cells not yet decided.                 *
    * ---------------------------------------------------------------- */
 
   let observer: MutationObserver | null = null;
-  let scanScheduled = false;
-
-  function pauseObserver(): void {
-    if (observer) observer.disconnect();
-  }
-  function resumeObserver(): void {
-    const root = timeline() || document.body;
-    if (observer && root && !shuttingDown) {
-      observer.observe(root, { childList: true, subtree: true });
-    }
-  }
-
-  function clearAllMarks(): void {
-    pauseObserver();
-    try { allMarkedCells().forEach(reveal); } finally { resumeObserver(); }
-  }
+  const SCAN_INTERVAL_MS = 250;
+  const SCROLL_IDLE_MS = 120;
+  let lastScan = 0;
+  let scanTimer: ReturnType<typeof setTimeout> | null = null;
+  let scrolling = false;
+  let scrollIdleTimer: ReturnType<typeof setTimeout> | null = null;
 
   function recount(): void {
     state.kept = document.querySelectorAll('[' + ATTR + '="kept"]').length;
     state.hidden = document.querySelectorAll('[' + ATTR + '="hidden"]').length;
   }
 
+  // The actual work. Cheap: only touches cells with no decision yet. Does NOT
+  // pause the observer; our writes are class/attribute changes which the
+  // observer is configured to ignore.
   function scan(): void {
     if (!extensionAlive()) { shutdown(); return; }
+    lastScan = Date.now();
     if (!state.enabled) return;
     // Off the feed (e.g. a tweet's comments are open): keep the feed exactly
-    // as X left it so its scroll restore on close is correct. Reveal anything
-    // we had hidden and do nothing else.
+    // as X left it so its scroll restore on close is correct.
     if (!onFilterablePage()) { unfilterAll(); return; }
 
-    pauseObserver();
-    try {
-      const cells = timelineCells();
-      cells.forEach(cell => {
-        const existing = cell.getAttribute(ATTR);
-        if (!isJudgeableTweet(cell)) {
-          if (existing) reveal(cell); // was marked before it rendered
-          return;
-        }
-        if (existing === "kept") return; // keep decisions are final
-        if (matchesKeywords(postText(cell))) {
-          if (existing) reveal(cell);
-          cell.setAttribute(ATTR, "kept");
-        } else {
-          hide(cell);
-        }
-      });
-      recount();
-      updateBadge();
-    } finally {
-      resumeObserver();
+    const cells = timelineCells();
+    for (const cell of cells) {
+      const existing = cell.getAttribute(ATTR);
+      if (existing === "kept") continue; // final
+      if (!isJudgeableTweet(cell)) {
+        if (existing) reveal(cell); // was marked before it rendered
+        continue;
+      }
+      if (matchesKeywords(postText(cell))) {
+        if (existing) reveal(cell);
+        cell.setAttribute(ATTR, "kept");
+      } else if (existing !== "hidden") {
+        hide(cell);
+      }
     }
+    recount();
+    updateBadge();
   }
 
+  // Throttled + scroll-aware scheduler. Never runs mid-scroll.
   function scheduleScan(): void {
-    if (scanScheduled) return;
-    scanScheduled = true;
-    requestAnimationFrame(() => {
-      scanScheduled = false;
+    if (scanTimer) return;
+    const since = Date.now() - lastScan;
+    const wait = scrolling ? SCROLL_IDLE_MS : Math.max(0, SCAN_INTERVAL_MS - since);
+    scanTimer = setTimeout(() => {
+      scanTimer = null;
+      if (scrolling) { scheduleScan(); return; } // defer until scroll settles
       scan();
-    });
+    }, wait);
+  }
+
+  function onScroll(): void {
+    scrolling = true;
+    if (scrollIdleTimer) clearTimeout(scrollIdleTimer);
+    scrollIdleTimer = setTimeout(() => {
+      scrolling = false;
+      scheduleScan(); // one scan after the gesture ends
+    }, SCROLL_IDLE_MS);
+  }
+
+  function clearAllMarks(): void {
+    allMarkedCells().forEach(reveal);
   }
 
   function unfilterAll(): void {
-    pauseObserver();
-    try {
-      allMarkedCells().forEach(reveal);
-      recount();
-      updateBadge();
-    } finally {
-      resumeObserver();
-    }
+    allMarkedCells().forEach(reveal);
+    recount();
+    updateBadge();
   }
 
   function rescan(): void {
@@ -364,23 +377,36 @@
     setKeywords(resolveKeywords(res));
 
     ensureStyle();
-    observer = new MutationObserver(scheduleScan);
-    scheduleScan();
-    resumeObserver();
 
-    // Safety-net scan. No scroll pinning, no geometry: just catches posts that
-    // streamed in without tripping the observer.
+    // One observer, attached once to the whole document. We only care that
+    // *something* was added; the throttled, scroll-aware scheduler decides
+    // when to actually scan. We ignore attribute mutations so our own class
+    // writes never trigger a rescan loop.
+    observer = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        if (m.addedNodes && m.addedNodes.length) { scheduleScan(); return; }
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // Passive scroll listener: marks "scrolling" so no scan runs mid-gesture.
+    window.addEventListener("scroll", onScroll, { passive: true, capture: true });
+
+    scheduleScan();
+
+    // Light safety-net: catches posts that streamed in without adding nodes we
+    // noticed. Cheap because scan() skips already-decided cells and is itself
+    // throttled + scroll-aware.
     timers.push(setInterval(() => {
       if (!extensionAlive()) { shutdown(); return; }
       ensureStyle();
       scheduleScan();
-    }, 1500));
+    }, 2000));
 
     // Detect entering/leaving the filterable page. Covers SPA navigation
     // (opening a tweet, profiles, search) and the For You / Following tab
     // switch. Leaving reveals everything so X's scroll restore on return is
-    // correct; entering re-binds the observer to the current timeline and
-    // re-applies on the next frame.
+    // correct.
     let wasFilterable = onFilterablePage();
     timers.push(setInterval(() => {
       if (!extensionAlive()) { shutdown(); return; }
@@ -388,8 +414,6 @@
       if (isFilterable !== wasFilterable) {
         wasFilterable = isFilterable;
         clearAllMarks();
-        pauseObserver();
-        resumeObserver();
         if (isFilterable) scheduleScan();
         else recount();
         updateBadge();
@@ -414,12 +438,9 @@
         if (changes.fullyRemove) {
           state.fullyRemove = changes.fullyRemove.newValue as boolean;
           // Re-apply hide class to already-hidden cells under the new mode.
-          pauseObserver();
-          try {
-            allMarkedCells().forEach(cell => {
-              if (cell.getAttribute(ATTR) === "hidden") hide(cell);
-            });
-          } finally { resumeObserver(); }
+          allMarkedCells().forEach(cell => {
+            if (cell.getAttribute(ATTR) === "hidden") hide(cell);
+          });
         }
         if (changes.keywordList || changes.customKeywords) {
           safeStorageGet(["keywordList", "customKeywords"], (res) => {
